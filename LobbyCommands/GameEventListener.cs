@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Linq;
 using System.Threading.Tasks;
 
 using Impostor.Api.Events;
@@ -7,74 +6,166 @@ using Impostor.Api.Innersloth;
 using Impostor.Api.Events.Player;
 
 using Microsoft.Extensions.Logging;
+using Impostor.Api.Net.Inner.Objects;
 
 namespace LobbyCommands
 {
     public class GameEventListener : IEventListener
     {
         readonly ILogger<LobbyCommandsPlugin> _logger;
-        readonly string[] _mapNames = Enum.GetNames(typeof(MapTypes));
+        private const string commandprefix = "/lc";
+
+        static readonly string[] _mapNames = Enum.GetNames(typeof(MapTypes));
+        static readonly int _minImposters = 1;
+        static int _maxImposters => Math.DivRem(_curPlayers, 3, out _);
+        static readonly int _minPlayers = 4;
+        static int _curPlayers = 10;
+        static readonly int _maxPlayers = 128;
+
+        private static string HelpText => $"- Lobby Commands Plugin -" +
+                    $"\n/lc help - Lists all available commands" +
+                    $"\n" +
+                    $"\n/lc impostors {{limit}} - Set the impostor limit ({_minImposters} - {_maxImposters})" +
+                    $"\n" +
+                    $"\n/lc players {{limit}} - Set the player limit ({_minPlayers} - {_maxPlayers})" +
+                    $"\n" +
+                    $"\n/lc map {{mapname}} - Set the map ({string.Join(", ", _mapNames)})";
 
         public GameEventListener(ILogger<LobbyCommandsPlugin> logger) => _logger = logger;
 
         [EventListener]
         public void OnPlayerChat(IPlayerChatEvent e)
         {
-            if (e.Game.GameState != GameStates.NotStarted || !e.Message.StartsWith("/") || !e.ClientPlayer.IsHost)
+            if (e.Game.GameState != GameStates.NotStarted || !e.Message.StartsWith(commandprefix) || !e.ClientPlayer.IsHost)
                 return;
 
-            Task.Run(async () => await DoCommands(e));
+            Task.Run(async () => await EvalCommand(e));
         }
 
-        private async Task DoCommands(IPlayerChatEvent e)
+        [EventListener]
+        public void OnGameCreated(IGameCreatedEvent e)
+        {
+            if (e.Game.GameState != GameStates.NotStarted)
+                return;
+
+            Task.Run(async () => await ShowMOTD(e));
+        }
+
+        private async Task ShowMOTD(IGameCreatedEvent e)
+        {
+            await Task.Delay(1000);
+            await SendChatAsServer(e.Game.Host.Character, HelpText);
+        }
+
+        private async Task SendChatAsServer(IInnerPlayerControl p, string msg)
+        {
+            var currentColor = p.PlayerInfo.ColorId;
+            var currentName = p.PlayerInfo.PlayerName;
+            await p.SetColorAsync(Impostor.Api.Innersloth.Customization.ColorType.White);
+            await p.SetNameAsync("LobbyCommands");
+            await p.SendChatAsync(msg);
+            await p.SetColorAsync(currentColor);
+            await p.SetNameAsync(currentName);
+        }
+
+        private async Task EvalCommand(IPlayerChatEvent e)
         {
             _logger.LogDebug($"Attempting to evaluate command from {e.PlayerControl.PlayerInfo.PlayerName} on {e.Game.Code.Code}. Message was: {e.Message}");
 
-            string[] parts = e.Message.ToLowerInvariant()[1..].Split(" ");
+            string[] args = e.Message.ToLowerInvariant()[($"{commandprefix} ".Length)..].Split(" ");
 
-            switch (parts[0])
+            switch (args[0])
             {
-                case "impostors":
-                    if (parts.Length == 1)
-                    {
-                        await e.PlayerControl.SendChatAsync($"Please specify the number of impostors.");
-                        return;
-                    }
-
-                    if (int.TryParse(parts[1], out int num))
-                    {
-                        num = Math.Clamp(num, 1, 3);
-
-                        await e.PlayerControl.SendChatAsync($"Setting the number of impostors to {num}");
-
-                        e.Game.Options.NumImpostors = num;
-                        await e.Game.SyncSettingsAsync();
-                    }
-                    else
-                        await e.PlayerControl.SendChatAsync($"Unable to convert '{parts[1]}' to a number!");
+                case "help":
+                    await SendChatAsServer(e.PlayerControl, HelpText);
                     break;
                 case "map":
-                    if (parts.Length == 1)
+                    if (args.Length != 2)
                     {
-                        await e.PlayerControl.SendChatAsync($"Please specify the map. Accepted values: {string.Join(", ", _mapNames)}");
+                        await SendChatAsServer(e.PlayerControl, $"/lc map {{mapname}}\nSet the current map. Options are: {string.Join(", ", _mapNames)}");
                         return;
                     }
 
-                    if (!_mapNames.Any(name => name.ToLowerInvariant() == parts[1]))
+                    var tryMap = Enum.TryParse<MapTypes>(args[1], ignoreCase: true, out var map);
+
+                    if (tryMap == false)
                     {
-                        await e.PlayerControl.SendChatAsync($"Unknown map. Accepted values: {string.Join(", ", _mapNames)}");
-                        return;
+                        await SendChatAsServer(e.PlayerControl, $"[FF0000FF]Error: Unknown map.");
+                        break;
                     }
 
-                    MapTypes map = Enum.Parse<MapTypes>(parts[1], true);
-
-                    await e.PlayerControl.SendChatAsync($"Setting map to {map}");
+                    await SendChatAsServer(e.PlayerControl, $"[00FF00FF]Map has been set to {map}");
 
                     e.Game.Options.Map = map;
                     await e.Game.SyncSettingsAsync();
                     break;
+                case "impostors":
+                    if (args.Length != 2)
+                    {
+                        await SendChatAsServer(e.PlayerControl, $"/lc impostors {{limit}} - Set the impostor limit. Value must be within {_minImposters} and {_maxImposters}");
+                        break;
+                    }
+
+                    var tryImpostorLimit = int.TryParse(args[1], out var impostorLimit);
+
+                    if (tryImpostorLimit == false)
+                    {
+                        await SendChatAsServer(e.PlayerControl, "[FF0000FF]Error: Please enter a valid whole number!");
+                        break;
+                    }
+
+                    if (impostorLimit > _maxImposters || impostorLimit < _minImposters)
+                    {
+                        await SendChatAsServer(e.PlayerControl, $"[FF0000FF]Error: Impostor limit can only be within {_maxImposters} and {_minImposters}!");
+                        await e.Game.SyncSettingsAsync();
+                        break;
+                    }
+
+                    impostorLimit = Math.Clamp(impostorLimit, _minImposters, _maxImposters);
+
+                    await SendChatAsServer(e.PlayerControl, $"[00FF00FF]Impostor limit has been set to {impostorLimit}");
+
+                    e.Game.Options.NumImpostors = impostorLimit;
+                    await e.Game.SyncSettingsAsync();
+                    break;
+                case "players":
+                    if (args.Length != 2)
+                    {
+                        await SendChatAsServer(e.PlayerControl, $"/lc players {{limit}} - Set the player limit. Value must be within {_minPlayers} and {_maxPlayers}");
+                        break;
+                    }
+
+                    bool tryPlayerLimit = int.TryParse(args[1], out var playerLimit);
+                    if (tryPlayerLimit == false)
+                    {
+                        await SendChatAsServer(e.PlayerControl, "[FF0000FF]Error: Please enter a valid whole number!");
+                        break;
+                    }
+
+                    if (playerLimit > _maxPlayers || playerLimit < _minPlayers)
+                    {
+                        await SendChatAsServer(e.PlayerControl, $"[FF0000FF]Error: Player limit can only be within {_minPlayers} and {_maxPlayers}!");
+                        await e.Game.SyncSettingsAsync();
+                        break;
+                    }
+
+                    _curPlayers = playerLimit;
+                    e.Game.Options.MaxPlayers = (byte)playerLimit;
+                    if (e.Game.Options.NumImpostors > _maxImposters)
+                    {
+                        e.Game.Options.NumImpostors = _maxImposters;
+                        await SendChatAsServer(e.PlayerControl, $"[00FF00FF]Player limit has been set to {playerLimit}!\nImposter limit was too high for the player limit and has been set to {_maxImposters}!\nNote: The counter will not change until someone joins/leaves!");
+                    }
+                    else
+                    {
+                        await SendChatAsServer(e.PlayerControl, $"[00FF00FF]Player limit has been set to {args[1]}!\nNote: The counter will not change until someone joins/leaves!");
+                    }
+
+                    await e.Game.SyncSettingsAsync();
+                    break;
                 default:
-                    _logger.LogInformation($"Unknown command {parts[0]} from {e.PlayerControl.PlayerInfo.PlayerName} on {e.Game.Code.Code}.");
+                    await SendChatAsServer(e.PlayerControl, $"[FF0000FF]unknown command: \"{args[0]}\"");
+                    _logger.LogInformation($"Unknown command {args[0]} from {e.PlayerControl.PlayerInfo.PlayerName} on {e.Game.Code.Code}.");
                     break;
             }
         }
